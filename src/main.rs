@@ -1,37 +1,29 @@
 //! # High-Performance MRF Processor in Rust
 //!
-//! This program processes large, gzipped Machine-Readable Files (MRFs) in JSON format.
-//! It's designed for high performance and low memory usage, using streaming and concurrency.
+//! Streams massive, gzipped JSON MRFs in two passes with low memory:
+//! 1) provider_references  2) in_network
 //!
-//! ## Execution Flow:
-//! 1.  **Two-Pass Strategy**: The input file is read twice to minimize memory footprint.
-//! 2.  **First Pass (References)**:
-//!     - Streams the JSON to find the `provider_references` array.
-//!     - Deserializes local references and identifies remote references (by URL).
-//!     - Fetches all remote references concurrently using `tokio` and `reqwest`.
-//!     - Consolidates all references and writes them out to `provider_references.json` and `provider_groups.csv`.
-//! 3.  **Second Pass (In-Network Items)**:
-//!     - Streams the JSON again to find the `in_network` array.
-//!     - Uses a bounded channel (`tokio::sync::mpsc`) to act as a work queue.
-//!     - A dedicated task reads `InNetworkItem`s and sends them to the channel.
-//!     - A pool of worker tasks receives items from the channel. Each worker processes an item
-//!       and writes the resulting CSV records to the appropriate file (e.g., `in_network_CODE.csv`).
-//!     - File writers are managed concurrently using a `DashMap` for thread-safe access without blocking.
-//! 4.  **R2 Upload**:
-//!     - After all local files are written, the program walks the output directory.
-//!     - It uploads all generated CSV files to the specified R2 bucket concurrently,
-//!       using a semaphore to limit the number of simultaneous uploads.
-//! 5.  **Cleanup**: Deletes the local output directory after a successful upload.
+//! Key design points:
+//! - **Streaming root-object arrays** via Serde `Visitor`/`DeserializeSeed` (no full JSON load)
+//! - **MPMC** work queue with `async_channel` for multi-consumer workers
+//! - **Per-code file writers** using `tokio::mpsc`
+//! - **Cloudflare R2** upload via AWS SDK (concurrent, bounded)
+//!
+//! Usage:
+//!   mrf_processor_rust <input_file.json.gz> <output_dir> <r2_prefix>
 
 use anyhow::{anyhow, Context, Result};
-use aws_config::meta::region::RegionProviderChain;
+use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use dashmap::DashMap;
 use flate2::read::GzDecoder;
 use futures::stream::{self, StreamExt};
-use serde::{Deserialize, Deserializer};
+use serde::{de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor}, Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -43,19 +35,19 @@ use tokio::task;
 
 // --- Data Structures (matching the JSON) ---
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Tin {
     r#type: String,
     value: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ProviderGroup {
     npi: Vec<serde_json::Value>,
     tin: Tin,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ProviderReference {
     provider_group_id: u64,
     provider_groups: Vec<ProviderGroup>,
@@ -96,6 +88,123 @@ struct InNetworkItem {
     billing_code_type: String,
     billing_code: String,
     negotiated_rates: Vec<NegotiatedRate>,
+}
+
+// --- Serde streaming seeds/visitors for array-by-key at root ---
+
+/// Streams every element of an array, invoking `cb` per element.
+struct ArrayStreamSeed<'a, F> {
+    cb: &'a mut F,
+}
+
+impl<'de, 'a, F> DeserializeSeed<'de> for ArrayStreamSeed<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ArrayStreamVisitor { cb: self.cb })
+    }
+}
+
+struct ArrayStreamVisitor<'a, F> {
+    cb: &'a mut F,
+}
+
+impl<'de, 'a, F> Visitor<'de> for ArrayStreamVisitor<'a, F>
+where
+    F: FnMut(Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "an array to stream")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(elem) = seq.next_element::<Value>()? {
+            (self.cb)(elem).map_err(serde::de::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+/// Looks for a specific key at the root object and streams its array value via `cb`.
+fn stream_root_array_by_key<R: std::io::Read, F: FnMut(Value) -> Result<()>>(
+    reader: R,
+    key: &str,
+    mut cb: F,
+) -> Result<()> {
+    struct RootKeySeed<'a, F> {
+        key: &'a str,
+        cb: &'a mut F,
+    }
+
+    impl<'de, 'a, F> DeserializeSeed<'de> for RootKeySeed<'a, F>
+    where
+        F: FnMut(Value) -> Result<()>,
+    {
+        type Value = ();
+
+        fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_map(RootKeyVisitor { key: self.key, cb: self.cb })
+        }
+    }
+
+    struct RootKeyVisitor<'a, F> {
+        key: &'a str,
+        cb: &'a mut F,
+    }
+
+    impl<'de, 'a, F> Visitor<'de> for RootKeyVisitor<'a, F>
+    where
+        F: FnMut(Value) -> Result<()>,
+    {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a JSON object at the root")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> std::result::Result<(), M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut found = false;
+            while let Some(k) = map.next_key::<String>()? {
+                if k == self.key {
+                    found = true;
+                    // Stream the array value element-by-element
+                    map.next_value_seed(ArrayStreamSeed { cb: self.cb })?;
+                } else {
+                    // Skip any other value efficiently
+                    let _ = map.next_value::<IgnoredAny>()?;
+                }
+            }
+            if !found {
+                return Err(serde::de::Error::custom(format!(
+                    "Key '{}' not found at root",
+                    self.key
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let seed = RootKeySeed { key, cb: &mut cb };
+    seed.deserialize(&mut de).map_err(|e| anyhow!(e))?;
+    Ok(())
 }
 
 // --- Main Application Logic ---
@@ -156,25 +265,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Finds the specified key at the root of the JSON object and returns a streaming deserializer
-/// positioned at the beginning of that key's value (expected to be an array).
-fn find_json_key_stream<'a, R: std::io::Read>(
-    reader: R,
-    key_to_find: &str,
-) -> Result<serde_json::StreamDeserializer<'a, serde_json::de::IoRead<R>, serde_json::Value>> {
-    let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<serde_json::Value>();
-
-    // Expect the start of the root object `{`
-    if let Some(Ok(serde_json::Value::Object(mut map))) = stream.next() {
-        if let Some(value) = map.remove(key_to_find) {
-            // Re-serialize the found value to create a new reader for streaming its contents
-            let temp_reader = std::io::Cursor::new(value.to_string());
-            return Ok(serde_json::Deserializer::from_reader(temp_reader).into_iter());
-        }
-    }
-    Err(anyhow!("Key '{}' not found at the root of the JSON file.", key_to_find))
-}
-
 /// Pass 1: Extracts local references, fetches remote ones, and writes consolidated results.
 async fn extract_and_fetch_references(
     input_path: &Path,
@@ -184,22 +274,28 @@ async fn extract_and_fetch_references(
     let gz = GzDecoder::new(file);
     let buf_reader = BufReader::new(gz);
 
-    println!("🔍 Searching for 'provider_references' key...");
-    let stream = find_json_key_stream(buf_reader, "provider_references")
-        .context("Could not find 'provider_references' stream")?;
-    
-    let (mut local_refs, mut remote_refs) = (vec![], vec![]);
-    for value in stream {
-        let ref_type: ReferenceType = serde_json::from_value(value?)?;
-        match ref_type {
-            ReferenceType::Local(r) => local_refs.push(r),
-            ReferenceType::Remote(r) => remote_refs.push(r),
+    println!("🔍 Streaming 'provider_references' ...");
+
+    let mut local_refs: Vec<ProviderReference> = Vec::new();
+    let mut remote_refs: Vec<RemoteProviderReference> = Vec::new();
+
+    // Stream elements of the provider_references array, pushing into lists
+    stream_root_array_by_key(buf_reader, "provider_references", |val| {
+        let r: ReferenceType = serde_json::from_value(val)?;
+        match r {
+            ReferenceType::Local(pr) => local_refs.push(pr),
+            ReferenceType::Remote(rr) => remote_refs.push(rr),
         }
-    }
-    println!("Found {} local and {} remote references.", local_refs.len(), remote_refs.len());
+        Ok(())
+    })?;
+
+    println!(
+        "Found {} local and {} remote references.",
+        local_refs.len(),
+        remote_refs.len()
+    );
 
     // Fetch remote references concurrently
-    let mut fetched_refs = Vec::with_capacity(remote_refs.len());
     if !remote_refs.is_empty() {
         println!("📡 Fetching {} remote references...", remote_refs.len());
         let client = reqwest::Client::new();
@@ -210,36 +306,42 @@ async fn extract_and_fetch_references(
                     match client.get(&remote_ref.location).send().await {
                         Ok(resp) => match resp.json::<ProviderReference>().await {
                             Ok(mut provider_ref) => {
-                                // Important: The fetched JSON doesn't contain the ID, so we add it back.
                                 provider_ref.provider_group_id = remote_ref.provider_group_id;
                                 Ok(provider_ref)
                             }
-                            Err(e) => Err(anyhow!("Failed to parse JSON from {}: {}", remote_ref.location, e)),
+                            Err(e) => Err(anyhow!(
+                                "Failed to parse JSON from {}: {}",
+                                remote_ref.location,
+                                e
+                            )),
                         },
                         Err(e) => Err(anyhow!("Failed to fetch {}: {}", remote_ref.location, e)),
                     }
                 }
             })
-            .buffer_unordered(100); // Concurrency limit
+            .buffer_unordered(100);
 
-        fetched_refs = bodies.filter_map(|res| async {
+        let fetched_refs = bodies
+            .filter_map(|res| async {
                 match res {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        eprintln!("Warning: {}", e); // Log error but continue
+                        eprintln!("Warning: {}", e);
                         None
                     }
                 }
-            }).collect::<Vec<_>>().await;
+            })
+            .collect::<Vec<_>>()
+            .await;
+
         println!("Successfully fetched {} remote references.", fetched_refs.len());
+        local_refs.extend(fetched_refs);
     }
 
-    let all_refs = [local_refs, fetched_refs].concat();
-
     // Write consolidated references to output files
-    write_provider_references_files(&all_refs, output_dir)?;
+    write_provider_references_files(&local_refs, output_dir)?;
 
-    Ok(all_refs)
+    Ok(local_refs)
 }
 
 /// Writes the provider references to both a JSON and a CSV file.
@@ -281,35 +383,32 @@ fn write_provider_references_files(refs: &[ProviderReference], output_dir: &Path
     Ok(())
 }
 
-
 /// Pass 2: Streams the in_network array and processes items using a pool of worker tasks.
 async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Result<()> {
     let in_network_dir = output_dir.join("in_network");
     fs::create_dir_all(&in_network_dir)?;
 
-    // A thread-safe map to hold file writers for each billing code.
     let writer_map: Arc<DashMap<String, mpsc::Sender<String>>> = Arc::new(DashMap::new());
-    
-    // Channel to send work from the JSON reader to the worker pool
-    let (tx, mut rx) = mpsc::channel::<InNetworkItem>(2048); // Bounded channel
+
+    // MPMC channel (async_channel) so multiple workers can receive.
+    let (tx, rx) = async_channel::bounded::<InNetworkItem>(2048);
 
     let item_count = Arc::new(AtomicU64::new(0));
     let start_time = Instant::now();
-    let total_workers = num_cpus::get_physical(); // Use physical cores
+    let total_workers = num_cpus::get_physical();
     println!("⚙️  Starting {} worker tasks for in-network processing.", total_workers);
 
     // --- Spawn Worker Tasks ---
     let mut worker_handles = Vec::new();
-    for i in 0..total_workers {
-        let mut rx = rx;
+    for _ in 0..total_workers {
+        let rx = rx.clone(); // Clone the receiver for each worker
         let writer_map = writer_map.clone();
         let in_network_dir = in_network_dir.clone();
         let item_count = item_count.clone();
-        let start_time = start_time.clone();
 
         let handle = task::spawn(async move {
-            while let Some(item) = rx.recv().await {
-                // Process the item and generate CSV lines
+            while let Ok(item) = rx.recv().await {
+                // Aggregate CSV lines per billing code to minimize writer contention
                 let mut records_by_code: HashMap<String, String> = HashMap::new();
                 for rate in &item.negotiated_rates {
                     for price in &rate.negotiated_prices {
@@ -333,109 +432,101 @@ async fn process_in_network_items(input_path: &Path, output_dir: &Path) -> Resul
                         }
                     }
                 }
-                
-                // Send records to the appropriate file writer task
+
                 for (code, records) in records_by_code {
-                     if let Some(writer_tx) = writer_map.get(&code) {
+                    if let Some(writer_tx) = writer_map.get(&code) {
                         if writer_tx.send(records).await.is_err() {
-                            // This means the receiver (file writer) has been dropped, which is an error.
                             eprintln!("Error: File writer for code {} has closed.", code);
                         }
                     } else {
-                        // Create a new file writer task for this billing code
+                        // Potential race: double-insert guard
                         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(128);
                         let file_path = in_network_dir.join(format!("in_network_{}.csv", code));
-                        writer_map.insert(code.clone(), writer_tx.clone());
 
-                        task::spawn(async move {
-                            let mut file = BufWriter::new(File::create(file_path).unwrap());
-                            file.write_all(b"provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class,billing_code_modifier\n").unwrap();
-                            while let Some(data) = writer_rx.recv().await {
-                                if file.write_all(data.as_bytes()).is_err() {
-                                     eprintln!("Error writing to file for code {}", code);
-                                }
+                        if let Some(existing) = writer_map.insert(code.clone(), writer_tx.clone()) {
+                            // Someone beat us; use existing and drop ours
+                            if existing.send(records).await.is_err() {
+                                eprintln!("Error: File writer for code {} has closed.", code);
                             }
-                            file.flush().unwrap();
-                        });
-                        
-                        writer_tx.send(records).await.unwrap();
+                        } else {
+                            // Spawn writer task for this code
+                            task::spawn(async move {
+                                let mut file =
+                                    BufWriter::new(File::create(file_path).expect("create file"));
+                                file.write_all(b"provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class,billing_code_modifier\n")
+                                    .expect("write header");
+                                while let Some(data) = writer_rx.recv().await {
+                                    if file.write_all(data.as_bytes()).is_err() {
+                                        eprintln!("Error writing to file for code {}", code);
+                                        break;
+                                    }
+                                }
+                                let _ = file.flush();
+                            });
+                            let _ = writer_tx.send(records).await;
+                        }
                     }
                 }
 
-                // Update and report progress
                 let count = item_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 10000 == 0 {
+                if count % 10_000 == 0 {
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    println!(
-                        "Processed {} items... ({:.2} items/sec)",
-                        count,
-                        count as f64 / elapsed
-                    );
+                    println!("Processed {} items... ({:.2} items/sec)", count, count as f64 / elapsed);
                 }
             }
         });
         worker_handles.push(handle);
     }
-    
-    // --- Spawn JSON Reader Task ---
-    // This task reads from the file and sends items to the workers.
-    // It runs on a separate blocking thread to avoid blocking the async runtime.
+
+    // --- Spawn JSON Reader Task (blocking thread, owns its PathBuf) ---
+    let input_path_owned = input_path.to_path_buf();
     let reader_handle = task::spawn_blocking(move || -> Result<()> {
-        let file = File::open(input_path).context("Failed to open input file for Pass 2")?;
+        let file = File::open(input_path_owned).context("Failed to open input file for Pass 2")?;
         let gz = GzDecoder::new(file);
         let buf_reader = BufReader::new(gz);
-        
-        println!("🔍 Searching for 'in_network' key...");
-        let stream = find_json_key_stream(buf_reader, "in_network")
-            .context("Could not find 'in_network' stream")?;
 
-        for value in stream {
-            let item: InNetworkItem = serde_json::from_value(value?)?;
-            if tx.blocking_send(item).is_err() {
-                // If the channel is closed, it means the workers are done.
-                break;
+        println!("🔍 Streaming 'in_network' ...");
+
+        stream_root_array_by_key(buf_reader, "in_network", |val| {
+            let item: InNetworkItem = serde_json::from_value(val)?;
+            // Send each item to workers; if the channel closed, stop
+            if tx.send_blocking(item).is_err() {
+                return Ok(());
             }
-        }
+            Ok(())
+        })?;
+
         Ok(())
     });
 
-    // Wait for the reader to finish, then close the channel to signal workers to stop.
+    // Wait for the reader; channel closes when tx is dropped at end of closure
     reader_handle.await??;
-    drop(tx);
 
     // Wait for all worker tasks to complete
     for handle in worker_handles {
         handle.await?;
     }
-    
-    // Signal all file writers to shut down by dropping their senders
+
+    // Drop all writer senders to let writer tasks exit (on channel close)
     writer_map.clear();
-    
+
     println!("Total items processed: {}", item_count.load(Ordering::Relaxed));
     Ok(())
 }
 
-/// Sets up the S3 client to connect to an R2 bucket.
+/// Sets up the S3 client to connect to an R2 bucket using the modern AWS SDK config.
 async fn setup_r2_client() -> Result<S3Client> {
     let account_id = env::var("R2_ACCOUNT_ID").context("R2_ACCOUNT_ID not set")?;
     let access_key_id = env::var("R2_ACCESS_KEY_ID").context("R2_ACCESS_KEY_ID not set")?;
-    let secret_access_key = env::var("R2_SECRET_ACCESS_KEY").context("R2_SECRET_ACCESS_KEY not set")?;
-    let bucket_name = env::var("R2_BUCKET_NAME").context("R2_BUCKET_NAME not set")?;
+    let secret_access_key =
+        env::var("R2_SECRET_ACCESS_KEY").context("R2_SECRET_ACCESS_KEY not set")?;
 
     let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
 
-    let credentials = aws_config::Credentials::new(
-        access_key_id,
-        secret_access_key,
-        None,
-        None,
-        "Static",
-    );
-    
-    let region_provider = RegionProviderChain::first_try(Region::new("auto"));
+    let credentials = Credentials::new(access_key_id, secret_access_key, None, None, "Static");
 
-    let config = aws_config::from_env()
-        .region(region_provider)
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(RegionProviderChain::first_try(Region::new("auto")))
         .credentials_provider(credentials)
         .endpoint_url(endpoint_url)
         .load()
@@ -444,10 +535,10 @@ async fn setup_r2_client() -> Result<S3Client> {
     Ok(S3Client::new(&config))
 }
 
-/// Walks the output directory and uploads all CSV files to R2 concurrently.
+/// Walks the output directory and uploads all files to R2 concurrently.
 async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> Result<()> {
     let bucket_name = env::var("R2_BUCKET_NAME").context("R2_BUCKET_NAME not set")?;
-    
+
     let mut files_to_upload = vec![];
     for entry in walkdir::WalkDir::new(output_dir) {
         let entry = entry?;
@@ -455,10 +546,15 @@ async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> R
             files_to_upload.push(entry.into_path());
         }
     }
-    
-    println!("Found {} files to upload to R2 bucket '{}'.", files_to_upload.len(), bucket_name);
+
+    println!(
+        "Found {} files to upload to R2 bucket '{}'.",
+        files_to_upload.len(),
+        bucket_name
+    );
 
     let sem = Arc::new(Semaphore::new(20)); // Limit concurrent uploads
+    let output_dir_owned = output_dir.to_path_buf();
 
     let mut tasks = Vec::new();
     for path in files_to_upload {
@@ -466,18 +562,25 @@ async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> R
         let client = client.clone();
         let bucket_name = bucket_name.clone();
         let r2_prefix = r2_prefix.to_string();
+        let output_dir = output_dir_owned.clone();
 
         let task = task::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let key = format!(
-                "{}/{}",
-                r2_prefix,
-                path.file_name().unwrap().to_str().unwrap()
-            );
-            
+            let rel = path
+                .strip_prefix(&output_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let key = if r2_prefix.is_empty() {
+                rel
+            } else {
+                format!("{}/{}", r2_prefix, rel)
+            };
+
             println!("Uploading {} to s3://{}/{}", path.display(), bucket_name, key);
 
-            let body = ByteStream::from_path(&path).await
+            let body = ByteStream::from_path(&path)
+                .await
                 .map_err(|e| anyhow!("Failed to read file {}: {}", path.display(), e))?;
 
             client
@@ -488,7 +591,7 @@ async fn upload_to_r2(client: S3Client, output_dir: &Path, r2_prefix: &str) -> R
                 .send()
                 .await
                 .map_err(|e| anyhow!("Failed to upload {}: {:?}", path.display(), e))?;
-            
+
             Ok::<(), anyhow::Error>(())
         });
         tasks.push(task);
